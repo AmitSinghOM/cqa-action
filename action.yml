@@ -93,13 +93,13 @@ runs:
     - name: Install cqa-analyzer ${{ inputs.version }}
       shell: bash
       env:
-        CQA_VERSION: ${{ inputs.version }}
-        CQA_DEEP: ${{ inputs.deep }}
+        WANTED_VERSION: ${{ inputs.version }}
+        WANTED_DEEP: ${{ inputs.deep }}
       run: |
         set -euo pipefail
         extra=""
-        if [ "$CQA_DEEP" = "true" ]; then extra="[deep]"; fi
-        python -m pip install --quiet --disable-pip-version-check "cqa-analyzer${extra}==${CQA_VERSION}"
+        if [ "$WANTED_DEEP" = "true" ]; then extra="[deep]"; fi
+        python -m pip install --quiet --disable-pip-version-check "cqa-analyzer${extra}==${WANTED_VERSION}"
         code-quality-analyzer --version
 
     - name: Changed-lines manifest
@@ -146,40 +146,58 @@ runs:
         SARIF: ${{ inputs.sarif-file }}
         EXTRA: ${{ inputs.extra-args }}
       run: |
-        set -uo pipefail
+        # The runner forces `bash -e -o pipefail` on composite steps, so a
+        # non-zero analyzer exit must be captured explicitly or the step dies
+        # before results are recorded. The verdict is enforced in a later step.
+        set -u
         args=("$PROJECT" --offline)
-        [ -n "$FAIL_ON" ]     && args+=(--fail-on "$FAIL_ON")
-        [ -n "$FAIL_UNDER" ]  && args+=(--fail-under "$FAIL_UNDER")
-        [ "$STRICT" = "true" ] && args+=(--strict)
-        [ -n "$BASELINE" ]    && args+=(--baseline "$BASELINE")
-        [ -n "$BASELINE" ] && [ "$NEW_ONLY" = "true" ] && args+=(--new-findings-only)
-        [ -n "$MANIFEST" ]    && args+=(--changed-lines-manifest "$MANIFEST")
-        [ -n "$FINGERPRINT" ] && args+=(--expect-config-fingerprint "$FINGERPRINT")
-        [ -n "$CONFIG" ]      && args+=(--config "$CONFIG")
+        if [ -n "$FAIL_ON" ]; then args+=(--fail-on "$FAIL_ON"); fi
+        if [ -n "$FAIL_UNDER" ]; then args+=(--fail-under "$FAIL_UNDER"); fi
+        if [ "$STRICT" = "true" ]; then args+=(--strict); fi
+        if [ -n "$BASELINE" ]; then
+          args+=(--baseline "$BASELINE")
+          if [ "$NEW_ONLY" = "true" ]; then args+=(--new-findings-only); fi
+        fi
+        if [ -n "$MANIFEST" ]; then args+=(--changed-lines-manifest "$MANIFEST"); fi
+        if [ -n "$FINGERPRINT" ]; then args+=(--expect-config-fingerprint "$FINGERPRINT"); fi
+        if [ -n "$CONFIG" ]; then args+=(--config "$CONFIG"); fi
         # shellcheck disable=SC2206 # intentional word splitting of extra args
-        [ -n "$EXTRA" ]       && args+=($EXTRA)
+        if [ -n "$EXTRA" ]; then args+=($EXTRA); fi
 
         report="$RUNNER_TEMP/code-quality-report.json"
-        code-quality-analyzer "${args[@]}" --output-format json > "$report"
-        code=$?
+        code=0
+        code-quality-analyzer "${args[@]}" --output-format json > "$report" || code=$?
         if [ -n "$SARIF" ]; then
           code-quality-analyzer "${args[@]}" --output-format sarif > "$SARIF" || true
-          echo "sarif-file=$SARIF" >> "$GITHUB_OUTPUT"
         fi
 
-        python - "$report" "$code" >> "$GITHUB_OUTPUT" <<'PY'
-        import json, sys
-        path, code = sys.argv[1], int(sys.argv[2])
+        # Outputs and CQA_* env for the success path; $RUNNER_TEMP/cqa-results.json
+        # for every path (the runner drops a failed composite action's outputs
+        # and env writes, and the failing path is the one callers inspect).
+        python - "$report" "$code" "$SARIF" <<'PY'
+        import json, os, sys
+        path, code, sarif = sys.argv[1], int(sys.argv[2]), sys.argv[3]
         try:
             r = json.load(open(path))
         except Exception:
             r = {}
         score = r.get("architecture_signal_score")
-        print(f"exit-code={code}")
-        print("verdict=" + ("pass" if code == 0 else "fail"))
-        print(f"score={'' if score is None else score}")
-        print(f"findings={len(r.get('findings') or [])}")
-        print(f"configuration-fingerprint={r.get('configuration_fingerprint', '')}")
+        values = {
+            "exit-code": code,
+            "verdict": "pass" if code == 0 else "fail",
+            "score": "" if score is None else score,
+            "findings": len(r.get("findings") or []),
+            "configuration-fingerprint": r.get("configuration_fingerprint", ""),
+            "sarif-file": sarif,
+        }
+        with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+            out.writelines(f"{k}={v}\n" for k, v in values.items())
+        with open(os.environ["GITHUB_ENV"], "a") as env:
+            env.writelines(f"CQA_{k.upper().replace('-', '_')}={v}\n" for k, v in values.items())
+        # The runner drops a failed composite action's outputs *and* env writes.
+        # This file survives: later steps can read it with `if: always()`.
+        with open(os.path.join(os.environ["RUNNER_TEMP"], "cqa-results.json"), "w") as fh:
+            json.dump({k.replace("-", "_"): v for k, v in values.items()}, fh)
         PY
 
         python - "$report" "$code" "$MANIFEST" >> "$GITHUB_STEP_SUMMARY" <<'PY'
@@ -212,7 +230,6 @@ runs:
             if len(findings) > 50:
                 print(f"| … | | | {len(findings) - 50} more |")
         PY
-        exit 0
 
     - name: Upload SARIF to code scanning
       if: inputs.upload-sarif == 'true' && inputs.sarif-file != ''

@@ -66,6 +66,15 @@ With code scanning (needs `security-events: write`):
 4 findings · 5 score not applicable · 6 config mismatch), `verdict`, `score`,
 `findings`, `sarif-file`, `configuration-fingerprint`.
 
+GitHub drops a composite action's outputs and environment writes when the
+action fails, which is exactly when you want them. The same values are
+therefore also written to `$RUNNER_TEMP/cqa-results.json` (keys
+`exit_code`, `verdict`, `score`, `findings`, `sarif_file`,
+`configuration_fingerprint`), which later steps can read with `if: always()`.
+On the success path the outputs above and `CQA_*` environment variables are
+set as well. The job summary and the `::error::` annotation carry the
+verdict on both paths.
+
 ## Guarantees
 
 - The analyzer runs with `--offline`; the action makes exactly one network
