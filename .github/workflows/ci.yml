@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  generator:
+    name: changed_lines.py (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.14']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install --quiet pytest "cqa-analyzer==2.45.0"
+      - run: pytest -q -p no:cacheprovider tests
+
+  action-fails-on-finding:
+    name: Action fails the failing fixture with exit 4
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: gate
+        uses: ./
+        continue-on-error: true
+        with:
+          path: tests/fixtures/failing
+          changed-lines: "false"
+          sarif-file: failing.sarif
+      - name: Assert
+        env:
+          OUTCOME: ${{ steps.gate.outcome }}
+          CODE: ${{ steps.gate.outputs.exit-code }}
+          VERDICT: ${{ steps.gate.outputs.verdict }}
+          FINDINGS: ${{ steps.gate.outputs.findings }}
+        run: |
+          set -euo pipefail
+          echo "outcome=$OUTCOME code=$CODE verdict=$VERDICT findings=$FINDINGS"
+          [ "$OUTCOME" = "failure" ]
+          [ "$CODE" = "4" ]
+          [ "$VERDICT" = "fail" ]
+          [ "$FINDINGS" -ge 1 ]
+          python -c 'import json; r=json.load(open("failing.sarif")); assert r["runs"][0]["results"], "SARIF has no results"'
+
+  action-passes-clean-project:
+    name: Action passes the clean fixture
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: gate
+        uses: ./
+        with:
+          path: tests/fixtures/passing
+          changed-lines: "false"
+          sarif-file: ""
+      - name: Assert
+        env:
+          CODE: ${{ steps.gate.outputs.exit-code }}
+          VERDICT: ${{ steps.gate.outputs.verdict }}
+          FP: ${{ steps.gate.outputs.configuration-fingerprint }}
+        run: |
+          set -euo pipefail
+          [ "$CODE" = "0" ] && [ "$VERDICT" = "pass" ]
+          [ "${#FP}" = "64" ]
+
+  action-changed-lines-auto:
+    # On pull requests the default "auto" mode diffs against the base; on
+    # pushes it gates the whole project. Either way the step must succeed.
+    name: Action with changed-lines auto
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: gate
+        uses: ./
+        with:
+          path: tests/fixtures/passing
+          sarif-file: ""
+      - run: test "${{ steps.gate.outputs.verdict }}" = "pass"

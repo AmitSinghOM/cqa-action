@@ -1,0 +1,232 @@
+name: "Code Quality Analyzer gate"
+description: >-
+  Deterministic, offline code-quality gate (cqa-analyzer) for eight languages.
+  Fails the job on new findings, emits SARIF for code scanning, and writes a
+  job summary. Never sends source code anywhere.
+author: "Amit Singh"
+branding:
+  icon: "shield"
+  color: "blue"
+
+inputs:
+  path:
+    description: "Directory to analyze."
+    default: "."
+  version:
+    description: >-
+      cqa-analyzer version to install (exact). The action's major tag tracks a
+      known-good default; override to pin your own.
+    default: "2.45.0"
+  deep:
+    description: "Install the [deep] extra (tree-sitter duplication and complexity for Go, C/C++, Rust)."
+    default: "false"
+  fail-on:
+    description: "Fail when any selected finding reaches this severity: warning, error, or empty to disable."
+    default: "warning"
+  fail-under:
+    description: "Fail when the architecture signal score is below this value (1.0-10.0). Empty to disable."
+    default: ""
+  strict:
+    description: "Fail on any coverage gap (unparsed files, truncated discovery, invalid manifests)."
+    default: "true"
+  baseline:
+    description: "Path to a privacy-safe baseline written with --write-baseline. Empty to disable."
+    default: ""
+  new-findings-only:
+    description: "With a baseline: only findings absent from it count."
+    default: "true"
+  changed-lines:
+    description: >-
+      Restrict gating to lines changed in this pull request. "auto" generates a
+      manifest from git diff against the PR base on pull_request events and
+      does nothing on other events; a file path uses that manifest; "false"
+      disables.
+    default: "auto"
+  expect-config-fingerprint:
+    description: "sha256 the effective configuration must match, so a PR cannot weaken the gate."
+    default: ""
+  config:
+    description: "Explicit config file instead of the project's own."
+    default: ""
+  sarif-file:
+    description: "Where to write the SARIF report. Empty to skip SARIF."
+    default: "code-quality-results.sarif"
+  upload-sarif:
+    description: >-
+      Upload the SARIF to GitHub code scanning. Requires `security-events: write`
+      and code scanning to be available for the repository.
+    default: "false"
+  extra-args:
+    description: "Additional analyzer arguments, space separated."
+    default: ""
+  python-version:
+    description: "Python used to run the analyzer."
+    default: "3.12"
+
+outputs:
+  exit-code:
+    description: "Analyzer exit code (0 pass, 1 below threshold, 2 nothing analyzed, 3 coverage gap, 4 findings, 5 score not applicable, 6 config mismatch)."
+    value: ${{ steps.gate.outputs.exit-code }}
+  verdict:
+    description: "pass or fail."
+    value: ${{ steps.gate.outputs.verdict }}
+  score:
+    description: "Architecture signal score, or empty when not applicable."
+    value: ${{ steps.gate.outputs.score }}
+  findings:
+    description: "Number of selected findings."
+    value: ${{ steps.gate.outputs.findings }}
+  sarif-file:
+    description: "Path of the SARIF report, when written."
+    value: ${{ steps.gate.outputs.sarif-file }}
+  configuration-fingerprint:
+    description: "sha256 of the effective analyzer configuration."
+    value: ${{ steps.gate.outputs.configuration-fingerprint }}
+
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install cqa-analyzer ${{ inputs.version }}
+      shell: bash
+      env:
+        CQA_VERSION: ${{ inputs.version }}
+        CQA_DEEP: ${{ inputs.deep }}
+      run: |
+        set -euo pipefail
+        extra=""
+        if [ "$CQA_DEEP" = "true" ]; then extra="[deep]"; fi
+        python -m pip install --quiet --disable-pip-version-check "cqa-analyzer${extra}==${CQA_VERSION}"
+        code-quality-analyzer --version
+
+    - name: Changed-lines manifest
+      id: changed
+      shell: bash
+      env:
+        MODE: ${{ inputs.changed-lines }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        ACTION_PATH: ${{ github.action_path }}
+        PROJECT: ${{ inputs.path }}
+      run: |
+        set -euo pipefail
+        manifest=""
+        case "$MODE" in
+          false|"") ;;
+          auto)
+            if [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ]; then
+              git -C "$PROJECT" fetch --quiet --no-tags --depth=1 origin "$BASE_SHA" "$HEAD_SHA" || true
+              manifest="$RUNNER_TEMP/changed-lines.json"
+              git -C "$PROJECT" diff --unified=0 --diff-filter=AMR --no-color "$BASE_SHA" "$HEAD_SHA" -- . \
+                | python "$ACTION_PATH/scripts/changed_lines.py" --output "$manifest"
+              echo "changed-lines: $(python -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["files"]))' "$manifest") files"
+            else
+              echo "changed-lines: not a pull_request event; gating the whole project"
+            fi ;;
+          *) manifest="$MODE" ;;
+        esac
+        echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
+
+    - name: Run the gate
+      id: gate
+      shell: bash
+      env:
+        PROJECT: ${{ inputs.path }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        FAIL_UNDER: ${{ inputs.fail-under }}
+        STRICT: ${{ inputs.strict }}
+        BASELINE: ${{ inputs.baseline }}
+        NEW_ONLY: ${{ inputs.new-findings-only }}
+        MANIFEST: ${{ steps.changed.outputs.manifest }}
+        FINGERPRINT: ${{ inputs.expect-config-fingerprint }}
+        CONFIG: ${{ inputs.config }}
+        SARIF: ${{ inputs.sarif-file }}
+        EXTRA: ${{ inputs.extra-args }}
+      run: |
+        set -uo pipefail
+        args=("$PROJECT" --offline)
+        [ -n "$FAIL_ON" ]     && args+=(--fail-on "$FAIL_ON")
+        [ -n "$FAIL_UNDER" ]  && args+=(--fail-under "$FAIL_UNDER")
+        [ "$STRICT" = "true" ] && args+=(--strict)
+        [ -n "$BASELINE" ]    && args+=(--baseline "$BASELINE")
+        [ -n "$BASELINE" ] && [ "$NEW_ONLY" = "true" ] && args+=(--new-findings-only)
+        [ -n "$MANIFEST" ]    && args+=(--changed-lines-manifest "$MANIFEST")
+        [ -n "$FINGERPRINT" ] && args+=(--expect-config-fingerprint "$FINGERPRINT")
+        [ -n "$CONFIG" ]      && args+=(--config "$CONFIG")
+        # shellcheck disable=SC2206 # intentional word splitting of extra args
+        [ -n "$EXTRA" ]       && args+=($EXTRA)
+
+        report="$RUNNER_TEMP/code-quality-report.json"
+        code-quality-analyzer "${args[@]}" --output-format json > "$report"
+        code=$?
+        if [ -n "$SARIF" ]; then
+          code-quality-analyzer "${args[@]}" --output-format sarif > "$SARIF" || true
+          echo "sarif-file=$SARIF" >> "$GITHUB_OUTPUT"
+        fi
+
+        python - "$report" "$code" >> "$GITHUB_OUTPUT" <<'PY'
+        import json, sys
+        path, code = sys.argv[1], int(sys.argv[2])
+        try:
+            r = json.load(open(path))
+        except Exception:
+            r = {}
+        score = r.get("architecture_signal_score")
+        print(f"exit-code={code}")
+        print("verdict=" + ("pass" if code == 0 else "fail"))
+        print(f"score={'' if score is None else score}")
+        print(f"findings={len(r.get('findings') or [])}")
+        print(f"configuration-fingerprint={r.get('configuration_fingerprint', '')}")
+        PY
+
+        python - "$report" "$code" "$MANIFEST" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+        import json, sys
+        path, code, manifest = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+        reasons = {0: "pass", 1: "score below --fail-under", 2: "nothing analyzed",
+                   3: "coverage gap", 4: "findings at or above --fail-on",
+                   5: "score not applicable", 6: "configuration fingerprint mismatch"}
+        try:
+            r = json.load(open(path))
+        except Exception:
+            r = {}
+        findings = r.get("findings") or []
+        print(f"## Code quality gate: {'✅ pass' if code == 0 else '❌ fail'} — {reasons.get(code, code)}")
+        print()
+        print(f"- analyzer {r.get('analyzer_version','?')} · ruleset {r.get('ruleset_version','?')} · "
+              f"scoring policy {r.get('scoring_policy_version','?')}")
+        print(f"- architecture signal score: {r.get('architecture_signal_score','n/a')}")
+        print(f"- selected findings: {len(findings)}" + (" (changed lines only)" if manifest else ""))
+        fp = r.get("configuration_fingerprint")
+        if fp:
+            print(f"- configuration fingerprint: `{fp}`")
+        if findings:
+            print()
+            print("| rule | severity | location | message |")
+            print("|---|---|---|---|")
+            for f in findings[:50]:
+                loc = f.get("location") or {}
+                print(f"| `{f.get('rule_id')}` | {f.get('severity')} | `{loc.get('path')}:{loc.get('line')}` | {f.get('message')} |")
+            if len(findings) > 50:
+                print(f"| … | | | {len(findings) - 50} more |")
+        PY
+        exit 0
+
+    - name: Upload SARIF to code scanning
+      if: inputs.upload-sarif == 'true' && inputs.sarif-file != ''
+      uses: github/codeql-action/upload-sarif@faaca9a8f6edddba5725ffe5adefdab6669a2eca # v3
+      with:
+        sarif_file: ${{ inputs.sarif-file }}
+        category: cqa-analyzer
+
+    - name: Enforce the verdict
+      shell: bash
+      env:
+        CODE: ${{ steps.gate.outputs.exit-code }}
+      run: |
+        if [ "$CODE" != "0" ]; then
+          echo "::error::code-quality-analyzer gate failed with exit code $CODE (see the job summary)"
+          exit "$CODE"
+        fi
