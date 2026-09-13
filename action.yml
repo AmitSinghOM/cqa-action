@@ -146,22 +146,27 @@ runs:
         SARIF: ${{ inputs.sarif-file }}
         EXTRA: ${{ inputs.extra-args }}
       run: |
-        set -uo pipefail
+        # The runner forces `bash -e -o pipefail` on composite steps, so a
+        # non-zero analyzer exit must be captured explicitly or the step dies
+        # before results are recorded. The verdict is enforced in a later step.
+        set -u
         args=("$PROJECT" --offline)
-        [ -n "$FAIL_ON" ]     && args+=(--fail-on "$FAIL_ON")
-        [ -n "$FAIL_UNDER" ]  && args+=(--fail-under "$FAIL_UNDER")
-        [ "$STRICT" = "true" ] && args+=(--strict)
-        [ -n "$BASELINE" ]    && args+=(--baseline "$BASELINE")
-        [ -n "$BASELINE" ] && [ "$NEW_ONLY" = "true" ] && args+=(--new-findings-only)
-        [ -n "$MANIFEST" ]    && args+=(--changed-lines-manifest "$MANIFEST")
-        [ -n "$FINGERPRINT" ] && args+=(--expect-config-fingerprint "$FINGERPRINT")
-        [ -n "$CONFIG" ]      && args+=(--config "$CONFIG")
+        if [ -n "$FAIL_ON" ]; then args+=(--fail-on "$FAIL_ON"); fi
+        if [ -n "$FAIL_UNDER" ]; then args+=(--fail-under "$FAIL_UNDER"); fi
+        if [ "$STRICT" = "true" ]; then args+=(--strict); fi
+        if [ -n "$BASELINE" ]; then
+          args+=(--baseline "$BASELINE")
+          if [ "$NEW_ONLY" = "true" ]; then args+=(--new-findings-only); fi
+        fi
+        if [ -n "$MANIFEST" ]; then args+=(--changed-lines-manifest "$MANIFEST"); fi
+        if [ -n "$FINGERPRINT" ]; then args+=(--expect-config-fingerprint "$FINGERPRINT"); fi
+        if [ -n "$CONFIG" ]; then args+=(--config "$CONFIG"); fi
         # shellcheck disable=SC2206 # intentional word splitting of extra args
-        [ -n "$EXTRA" ]       && args+=($EXTRA)
+        if [ -n "$EXTRA" ]; then args+=($EXTRA); fi
 
         report="$RUNNER_TEMP/code-quality-report.json"
-        code-quality-analyzer "${args[@]}" --output-format json > "$report"
-        code=$?
+        code=0
+        code-quality-analyzer "${args[@]}" --output-format json > "$report" || code=$?
         if [ -n "$SARIF" ]; then
           code-quality-analyzer "${args[@]}" --output-format sarif > "$SARIF" || true
         fi
@@ -225,7 +230,6 @@ runs:
             if len(findings) > 50:
                 print(f"| … | | | {len(findings) - 50} more |")
         PY
-        exit 0
 
     - name: Upload SARIF to code scanning
       if: inputs.upload-sarif == 'true' && inputs.sarif-file != ''
