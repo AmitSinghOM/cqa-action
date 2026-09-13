@@ -93,13 +93,13 @@ runs:
     - name: Install cqa-analyzer ${{ inputs.version }}
       shell: bash
       env:
-        CQA_VERSION: ${{ inputs.version }}
-        CQA_DEEP: ${{ inputs.deep }}
+        WANTED_VERSION: ${{ inputs.version }}
+        WANTED_DEEP: ${{ inputs.deep }}
       run: |
         set -euo pipefail
         extra=""
-        if [ "$CQA_DEEP" = "true" ]; then extra="[deep]"; fi
-        python -m pip install --quiet --disable-pip-version-check "cqa-analyzer${extra}==${CQA_VERSION}"
+        if [ "$WANTED_DEEP" = "true" ]; then extra="[deep]"; fi
+        python -m pip install --quiet --disable-pip-version-check "cqa-analyzer${extra}==${WANTED_VERSION}"
         code-quality-analyzer --version
 
     - name: Changed-lines manifest
@@ -164,22 +164,32 @@ runs:
         code=$?
         if [ -n "$SARIF" ]; then
           code-quality-analyzer "${args[@]}" --output-format sarif > "$SARIF" || true
-          echo "sarif-file=$SARIF" >> "$GITHUB_OUTPUT"
         fi
 
-        python - "$report" "$code" >> "$GITHUB_OUTPUT" <<'PY'
-        import json, sys
-        path, code = sys.argv[1], int(sys.argv[2])
+        # Outputs for the success path, and CQA_* job environment variables for
+        # every path: a composite action's outputs are dropped by the runner
+        # when the action fails, and the failing path is the one callers
+        # most need to inspect.
+        python - "$report" "$code" "$SARIF" <<'PY'
+        import json, os, sys
+        path, code, sarif = sys.argv[1], int(sys.argv[2]), sys.argv[3]
         try:
             r = json.load(open(path))
         except Exception:
             r = {}
         score = r.get("architecture_signal_score")
-        print(f"exit-code={code}")
-        print("verdict=" + ("pass" if code == 0 else "fail"))
-        print(f"score={'' if score is None else score}")
-        print(f"findings={len(r.get('findings') or [])}")
-        print(f"configuration-fingerprint={r.get('configuration_fingerprint', '')}")
+        values = {
+            "exit-code": code,
+            "verdict": "pass" if code == 0 else "fail",
+            "score": "" if score is None else score,
+            "findings": len(r.get("findings") or []),
+            "configuration-fingerprint": r.get("configuration_fingerprint", ""),
+            "sarif-file": sarif,
+        }
+        with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+            out.writelines(f"{k}={v}\n" for k, v in values.items())
+        with open(os.environ["GITHUB_ENV"], "a") as env:
+            env.writelines(f"CQA_{k.upper().replace('-', '_')}={v}\n" for k, v in values.items())
         PY
 
         python - "$report" "$code" "$MANIFEST" >> "$GITHUB_STEP_SUMMARY" <<'PY'

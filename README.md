@@ -66,6 +66,12 @@ With code scanning (needs `security-events: write`):
 4 findings · 5 score not applicable · 6 config mismatch), `verdict`, `score`,
 `findings`, `sarif-file`, `configuration-fingerprint`.
 
+GitHub drops a composite action's outputs when the action fails, which is
+exactly when you want them, so the same values are also exported as job
+environment variables `CQA_EXIT_CODE`, `CQA_VERDICT`, `CQA_SCORE`,
+`CQA_FINDINGS`, `CQA_SARIF_FILE`, `CQA_CONFIGURATION_FINGERPRINT` for later
+steps (use `continue-on-error: true` or `if: always()` to reach them).
+
 ## Guarantees
 
 - The analyzer runs with `--offline`; the action makes exactly one network
