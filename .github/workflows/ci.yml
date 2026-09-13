@@ -42,18 +42,22 @@ jobs:
           changed-lines: "false"
           sarif-file: failing.sarif
       - name: Assert
-        # A composite action's outputs are dropped when it fails; the action
-        # therefore also exports CQA_* job environment variables.
+        # The runner drops a failed composite action's outputs and env writes;
+        # the action therefore also writes $RUNNER_TEMP/cqa-results.json.
         env:
           OUTCOME: ${{ steps.gate.outcome }}
         run: |
           set -euo pipefail
-          echo "outcome=$OUTCOME code=$CQA_EXIT_CODE verdict=$CQA_VERDICT findings=$CQA_FINDINGS"
           [ "$OUTCOME" = "failure" ]
-          [ "$CQA_EXIT_CODE" = "4" ]
-          [ "$CQA_VERDICT" = "fail" ]
-          [ "$CQA_FINDINGS" -ge 1 ]
-          [ "$CQA_SARIF_FILE" = "failing.sarif" ]
+          cat "$RUNNER_TEMP/cqa-results.json"; echo
+          python - <<'PY'
+          import json, os
+          r = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "cqa-results.json")))
+          assert r["exit_code"] == 4, r
+          assert r["verdict"] == "fail", r
+          assert r["findings"] >= 1, r
+          assert r["sarif_file"] == "failing.sarif", r
+          PY
           python -c 'import json; r=json.load(open("failing.sarif")); assert r["runs"][0]["results"], "SARIF has no results"'
 
   action-passes-clean-project:

@@ -166,10 +166,9 @@ runs:
           code-quality-analyzer "${args[@]}" --output-format sarif > "$SARIF" || true
         fi
 
-        # Outputs for the success path, and CQA_* job environment variables for
-        # every path: a composite action's outputs are dropped by the runner
-        # when the action fails, and the failing path is the one callers
-        # most need to inspect.
+        # Outputs and CQA_* env for the success path; $RUNNER_TEMP/cqa-results.json
+        # for every path (the runner drops a failed composite action's outputs
+        # and env writes, and the failing path is the one callers inspect).
         python - "$report" "$code" "$SARIF" <<'PY'
         import json, os, sys
         path, code, sarif = sys.argv[1], int(sys.argv[2]), sys.argv[3]
@@ -190,6 +189,10 @@ runs:
             out.writelines(f"{k}={v}\n" for k, v in values.items())
         with open(os.environ["GITHUB_ENV"], "a") as env:
             env.writelines(f"CQA_{k.upper().replace('-', '_')}={v}\n" for k, v in values.items())
+        # The runner drops a failed composite action's outputs *and* env writes.
+        # This file survives: later steps can read it with `if: always()`.
+        with open(os.path.join(os.environ["RUNNER_TEMP"], "cqa-results.json"), "w") as fh:
+            json.dump({k.replace("-", "_"): v for k, v in values.items()}, fh)
         PY
 
         python - "$report" "$code" "$MANIFEST" >> "$GITHUB_STEP_SUMMARY" <<'PY'
