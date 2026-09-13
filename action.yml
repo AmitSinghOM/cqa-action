@@ -16,7 +16,7 @@ inputs:
     description: >-
       cqa-analyzer version to install (exact). The action's major tag tracks a
       known-good default; override to pin your own.
-    default: "2.45.0"
+    default: "3.0.0"
   deep:
     description: "Install the [deep] extra (tree-sitter duplication and complexity for Go, C/C++, Rust)."
     default: "false"
