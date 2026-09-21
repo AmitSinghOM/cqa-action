@@ -16,7 +16,7 @@ inputs:
     description: >-
       cqa-analyzer version to install (exact). The action's major tag tracks a
       known-good default; override to pin your own.
-    default: "3.0.0"
+    default: "3.3.0"
   deep:
     description: "Install the [deep] extra (tree-sitter duplication and complexity for Go, C/C++, Rust)."
     default: "false"
@@ -99,7 +99,7 @@ runs:
         set -euo pipefail
         extra=""
         if [ "$WANTED_DEEP" = "true" ]; then extra="[deep]"; fi
-        python -m pip install --quiet --disable-pip-version-check "cqa-analyzer${extra}==${WANTED_VERSION}"
+        python -P -m pip install --quiet --disable-pip-version-check "cqa-analyzer${extra}==${WANTED_VERSION}"
         code-quality-analyzer --version
 
     - name: Changed-lines manifest
@@ -122,7 +122,7 @@ runs:
               manifest="$RUNNER_TEMP/changed-lines.json"
               git -C "$PROJECT" diff --unified=0 --diff-filter=AMR --no-color "$BASE_SHA" "$HEAD_SHA" -- . \
                 | python "$ACTION_PATH/scripts/changed_lines.py" --output "$manifest"
-              echo "changed-lines: $(python -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["files"]))' "$manifest") files"
+              echo "changed-lines: $(python -P -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["files"]))' "$manifest") files"
             else
               echo "changed-lines: not a pull_request event; gating the whole project"
             fi ;;
@@ -174,7 +174,7 @@ runs:
         # Outputs and CQA_* env for the success path; $RUNNER_TEMP/cqa-results.json
         # for every path (the runner drops a failed composite action's outputs
         # and env writes, and the failing path is the one callers inspect).
-        python - "$report" "$code" "$SARIF" <<'PY'
+        python -P - "$report" "$code" "$SARIF" <<'PY'
         import json, os, sys
         path, code, sarif = sys.argv[1], int(sys.argv[2]), sys.argv[3]
         try:
@@ -200,7 +200,7 @@ runs:
             json.dump({k.replace("-", "_"): v for k, v in values.items()}, fh)
         PY
 
-        python - "$report" "$code" "$MANIFEST" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+        python -P - "$report" "$code" "$MANIFEST" >> "$GITHUB_STEP_SUMMARY" <<'PY'
         import json, sys
         path, code, manifest = sys.argv[1], int(sys.argv[2]), sys.argv[3]
         reasons = {0: "pass", 1: "score below --fail-under", 2: "nothing analyzed",
