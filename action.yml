@@ -40,8 +40,16 @@ inputs:
       Restrict gating to lines changed in this pull request. "auto" generates a
       manifest from git diff against the PR base on pull_request events and
       does nothing on other events; a file path uses that manifest; "false"
-      disables.
+      disables. The diff ends at the checked-out commit (GitHub's merge commit
+      by default) and paths are relative to `path`. Checking out the PR head
+      instead needs history (actions/checkout fetch-depth: 0); without it the
+      step fails rather than gating the wrong lines.
     default: "auto"
+  include-deletions:
+    description: >-
+      With changed-lines auto: also count a deleted-only hunk as touching the
+      line that now follows it, so a finding there is gated.
+    default: "false"
   expect-config-fingerprint:
     description: "sha256 the effective configuration must match, so a PR cannot weaken the gate."
     default: ""
@@ -107,6 +115,7 @@ runs:
       shell: bash
       env:
         MODE: ${{ inputs.changed-lines }}
+        INCLUDE_DELETIONS: ${{ inputs.include-deletions }}
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         ACTION_PATH: ${{ github.action_path }}
@@ -114,19 +123,26 @@ runs:
       run: |
         set -euo pipefail
         manifest=""
+        case "$INCLUDE_DELETIONS" in
+          true) deletions=(--include-deletions) ;;
+          false|"") deletions=() ;;
+          *) echo "::error::include-deletions must be true or false"; exit 1 ;;
+        esac
         case "$MODE" in
           false|"") ;;
           auto)
             if [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ]; then
-              git -C "$PROJECT" fetch --quiet --no-tags --depth=1 origin "$BASE_SHA" "$HEAD_SHA" || true
               manifest="$RUNNER_TEMP/changed-lines.json"
-              git -C "$PROJECT" diff --unified=0 --diff-filter=AMR --no-color "$BASE_SHA" "$HEAD_SHA" -- . \
-                | python "$ACTION_PATH/scripts/changed_lines.py" --output "$manifest"
+              bash "$ACTION_PATH/scripts/pr_changed_lines.sh" \
+                "$BASE_SHA" "$HEAD_SHA" "$PROJECT" "$manifest" ${deletions[@]+"${deletions[@]}"}
               echo "changed-lines: $(python -P -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["files"]))' "$manifest") files"
             else
               echo "changed-lines: not a pull_request event; gating the whole project"
             fi ;;
           *) manifest="$MODE" ;;
+        esac
+        case "$manifest" in
+          *$'\n'*|*$'\r'*) echo "::error::changed-lines path must not contain a line break"; exit 1 ;;
         esac
         echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
 
@@ -174,59 +190,96 @@ runs:
         # Outputs and CQA_* env for the success path; $RUNNER_TEMP/cqa-results.json
         # for every path (the runner drops a failed composite action's outputs
         # and env writes, and the failing path is the one callers inspect).
+        # The report describes untrusted code, so every value is type-checked
+        # and written with a random heredoc delimiter: a line break in any
+        # value cannot start a new output or environment variable.
         python -P - "$report" "$code" "$SARIF" <<'PY'
-        import json, os, sys
+        import json, os, re, secrets, sys
         path, code, sarif = sys.argv[1], int(sys.argv[2]), sys.argv[3]
         try:
             r = json.load(open(path))
         except Exception:
             r = {}
+        if not isinstance(r, dict):
+            r = {}
         score = r.get("architecture_signal_score")
+        if isinstance(score, bool) or not isinstance(score, (int, float)):
+            score = ""
+        findings = r.get("findings")
+        fingerprint = r.get("configuration_fingerprint")
+        if not (isinstance(fingerprint, str) and re.fullmatch(r"[0-9a-f]{64}", fingerprint)):
+            fingerprint = ""
         values = {
             "exit-code": code,
             "verdict": "pass" if code == 0 else "fail",
-            "score": "" if score is None else score,
-            "findings": len(r.get("findings") or []),
-            "configuration-fingerprint": r.get("configuration_fingerprint", ""),
+            "score": score,
+            "findings": len(findings) if isinstance(findings, list) else 0,
+            "configuration-fingerprint": fingerprint,
             "sarif-file": sarif,
         }
+
+        def entry(name, value):
+            value = str(value)
+            delimiter = f"ghadelimiter_{secrets.token_hex(16)}"
+            while delimiter in value:
+                delimiter = f"ghadelimiter_{secrets.token_hex(16)}"
+            return f"{name}<<{delimiter}\n{value}\n{delimiter}\n"
+
         with open(os.environ["GITHUB_OUTPUT"], "a") as out:
-            out.writelines(f"{k}={v}\n" for k, v in values.items())
+            out.writelines(entry(k, v) for k, v in values.items())
         with open(os.environ["GITHUB_ENV"], "a") as env:
-            env.writelines(f"CQA_{k.upper().replace('-', '_')}={v}\n" for k, v in values.items())
+            env.writelines(entry(f"CQA_{k.upper().replace('-', '_')}", v) for k, v in values.items())
         # The runner drops a failed composite action's outputs *and* env writes.
         # This file survives: later steps can read it with `if: always()`.
         with open(os.path.join(os.environ["RUNNER_TEMP"], "cqa-results.json"), "w") as fh:
             json.dump({k.replace("-", "_"): v for k, v in values.items()}, fh)
         PY
 
+        # Paths, messages and rule ids come from the PR, so every value is
+        # rendered as inert text: control characters become spaces, ASCII
+        # punctuation becomes a numeric entity (no HTML, links, mentions,
+        # table breaks or code-span escapes), and each cell is length-bounded.
         python -P - "$report" "$code" "$MANIFEST" >> "$GITHUB_STEP_SUMMARY" <<'PY'
-        import json, sys
+        import json, re, string, sys
         path, code, manifest = sys.argv[1], int(sys.argv[2]), sys.argv[3]
         reasons = {0: "pass", 1: "score below --fail-under", 2: "nothing analyzed",
                    3: "coverage gap", 4: "findings at or above --fail-on",
                    5: "score not applicable", 6: "configuration fingerprint mismatch"}
+        punct = {ord(c): f"&#{ord(c)};" for c in string.punctuation}
+
+        def text(value, limit=300):
+            value = re.sub(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]", " ", str(value))
+            if len(value) > limit:
+                value = value[:limit] + "…"
+            return value.translate(punct)
+
         try:
             r = json.load(open(path))
         except Exception:
             r = {}
-        findings = r.get("findings") or []
-        print(f"## Code quality gate: {'✅ pass' if code == 0 else '❌ fail'} — {reasons.get(code, code)}")
+        if not isinstance(r, dict):
+            r = {}
+        findings = r.get("findings")
+        findings = [f for f in findings if isinstance(f, dict)] if isinstance(findings, list) else []
+        print(f"## Code quality gate: {'✅ pass' if code == 0 else '❌ fail'} — {text(reasons.get(code, code))}")
         print()
-        print(f"- analyzer {r.get('analyzer_version','?')} · ruleset {r.get('ruleset_version','?')} · "
-              f"scoring policy {r.get('scoring_policy_version','?')}")
-        print(f"- architecture signal score: {r.get('architecture_signal_score','n/a')}")
+        print(f"- analyzer {text(r.get('analyzer_version','?'))} · ruleset {text(r.get('ruleset_version','?'))} · "
+              f"scoring policy {text(r.get('scoring_policy_version','?'))}")
+        print(f"- architecture signal score: {text(r.get('architecture_signal_score','n/a'))}")
         print(f"- selected findings: {len(findings)}" + (" (changed lines only)" if manifest else ""))
         fp = r.get("configuration_fingerprint")
-        if fp:
+        if isinstance(fp, str) and re.fullmatch(r"[0-9a-f]{64}", fp):
             print(f"- configuration fingerprint: `{fp}`")
         if findings:
             print()
             print("| rule | severity | location | message |")
             print("|---|---|---|---|")
             for f in findings[:50]:
-                loc = f.get("location") or {}
-                print(f"| `{f.get('rule_id')}` | {f.get('severity')} | `{loc.get('path')}:{loc.get('line')}` | {f.get('message')} |")
+                loc = f.get("location")
+                loc = loc if isinstance(loc, dict) else {}
+                print(f"| <code>{text(f.get('rule_id'), 120)}</code> | {text(f.get('severity'), 20)} | "
+                      f"<code>{text(loc.get('path'), 200)}:{text(loc.get('line'), 12)}</code> | "
+                      f"{text(f.get('message'))} |")
             if len(findings) > 50:
                 print(f"| … | | | {len(findings) - 50} more |")
         PY

@@ -3,7 +3,8 @@
 One-line GitHub Action for [cqa-analyzer](https://github.com/AmitSinghOM/code-quality-analyzer):
 a deterministic, offline code-quality gate for Python, Go, TypeScript/JavaScript,
 Java, Kotlin, C#, C/C++ and Rust. It fails the job on new findings, writes a
-job summary, emits SARIF for code scanning, and never sends source code anywhere.
+job summary and emits SARIF for code scanning. Analysis runs locally; summaries
+and optional uploads disclose report content to GitHub.
 
 ```yaml
 - uses: AmitSinghOM/cqa-action@v1
@@ -53,12 +54,36 @@ With code scanning (needs `security-events: write`):
 | `baseline` | | Privacy-safe baseline written with `--write-baseline` |
 | `new-findings-only` | `true` | With a baseline, only findings absent from it count |
 | `changed-lines` | `auto` | `auto` (diff against PR base on `pull_request`), a manifest path, or `false` |
+| `include-deletions` | `false` | With `auto`, count a deleted-only hunk as touching the line that now follows it |
 | `expect-config-fingerprint` | | sha256 the effective configuration must match |
 | `config` | | Explicit config file |
 | `sarif-file` | `code-quality-results.sarif` | SARIF output path; empty skips |
 | `upload-sarif` | `false` | Upload SARIF to GitHub code scanning |
 | `extra-args` | | Extra analyzer arguments |
 | `python-version` | `3.12` | Interpreter used to run the analyzer |
+
+## Changed lines on pull requests
+
+`changed-lines: auto` diffs up to the commit that is actually checked out, so
+line numbers match the tree the analyzer scans, and paths are relative to
+`path`.
+
+- **Default checkout** (GitHub's merge commit): the diff is taken against the
+  merge commit's base-side parent, so changes that landed on the base branch
+  after the PR was opened are not attributed to it. A shallow checkout works;
+  the action fetches that one parent commit at depth 1 if it is missing.
+- **Head checkout** (`ref: ${{ github.event.pull_request.head.sha }}`) or any
+  other commit: the diff is taken against `merge-base(base, HEAD)`, which needs
+  history. Use `fetch-depth: 0`. Without it the step fails with an error
+  instead of gating the wrong lines.
+
+The diff ignores external diff drivers, textconv filters and the checkout's
+own `.gitattributes`, so a pull request cannot hide its changes by marking
+files binary. A changed file whose path the manifest cannot represent, a
+malformed diff, or a manifest over the analyzer's limits fails the step.
+Git must support `--attr-source` for attribute isolation (verified locally on
+Apple Git 2.54.0); an unsupported Git fails visibly. Uncommitted changes made by
+earlier steps are not in this commit-to-commit selection.
 
 ## Outputs
 
@@ -77,13 +102,33 @@ verdict on both paths.
 
 ## Guarantees
 
-- The analyzer runs with `--offline`; the action makes exactly one network
-  call of its own, `pip install` of the pinned version.
+- The analyzer runs with `--offline`. The action's own network calls are
+  `pip install` of the pinned version and, with `changed-lines: auto` on a
+  shallow checkout, a depth-1 `git fetch` of the diff's base commit from
+  `origin`. Python setup may also download an interpreter; `upload-sarif`
+  explicitly sends the SARIF report to GitHub. Offline analysis does not disable
+  those host operations. Reports and summaries include paths/messages; review
+  repository access and artifact/cache retention before scanning sensitive code.
+- Step outputs, `CQA_*` variables and the job summary treat report values as
+  untrusted: values are written with a random heredoc delimiter, so a line
+  break cannot add a variable, and summary cells are rendered as inert text.
 - Same ruleset, scoring policy and configuration fingerprint as the CLI and
-  the `cqa-mcp` server, so an agent, a developer and CI see identical results.
+  the `cqa-mcp` server when versions match. Matching findings also require the
+  same source, configuration, grammar availability and selection policy. MCP
+  gates require explicit severity selection; this action defaults to warnings.
 - Every third-party action is pinned to a commit SHA.
-- The changed-lines generator (`scripts/changed_lines.py`) is stdlib only and
-  tested against the real analyzer.
+- The changed-lines generator (`scripts/changed_lines.py`) is stdlib only,
+  so it works with any `version`, and is tested against the real analyzer and
+  for matching golden-fixture output to the analyzer's `diff_to_manifest`.
+  Empty/hunkless diffs are accepted here but rejected by that core converter.
+
+## Unreleased behavior changes
+
+Quoted UTF-8 paths, subdirectory selection and checkout revision selection are
+corrected. `include-deletions` is optional and defaults to false. Missing history
+now fails visibly instead of silently producing the wrong selection; head-SHA
+checkouts need `fetch-depth: 0`. Report output and summary text are hardened.
+These changes are local and have not been published under a release tag.
 
 ## Versioning
 
